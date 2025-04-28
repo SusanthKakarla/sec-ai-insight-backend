@@ -2,6 +2,8 @@ from typing import Dict, Any, List
 from database.mongo_db import get_company_by_cik, update_company_filings
 from datetime import datetime
 from math import ceil
+from urllib.parse import quote
+
 
 async def get_company(cik: str, page: int, limit: int, filing_type: str = "") -> Dict[str, Any]:
     """
@@ -13,6 +15,9 @@ async def get_company(cik: str, page: int, limit: int, filing_type: str = "") ->
     
     # Get all filings
     filings = company.get("filings", [])
+
+    for filing in filings:
+        filing["url"] = f"http://127.0.0.1:8000/proxy?url={quote(filing['url'])}"
     
     # Get all unique filing types for metadata
     all_filing_types = ["All"] + list(set(f.get("formType") for f in filings))
