@@ -61,17 +61,17 @@ async def search_companies_by_text(query: str, limit: int = 10) -> List[Dict[str
 async def get_filing(cik: str, accession_number: str):
     logging.info(f"Received request for CIK {cik} and accession number {accession_number}")
     try: 
-        logging.info(f"Querying MongoDB for CIK {cik} and accession number {accession_number}")
+        logging.info(f"Querying MongoDB for CIK {cik.lstrip('0')} and accession number {accession_number}")
         company = companies_collection.find_one(
             {"cik": cik.lstrip('0')},
             {"filings": {"$elemMatch": {"_id": accession_number}}}
         )
 
         if not company or not company.get('filings'):
-            logging.warning(f"No filing found for CIK {cik} and accession number {accession_number}")
+            logging.warning(f"No filing found for CIK {cik.lstrip('0')} and accession number {accession_number}")
             raise HTTPException(
                 status_code=404,
-                detail=f"No filing found for CIK {cik} and accession number {accession_number}"
+                detail=f"No filing found for CIK {cik.lstrip('0')} and accession number {accession_number}"
             )
         return {
             "cik": cik, 
