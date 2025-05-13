@@ -6,6 +6,10 @@ import logging
 from database.mongo_db import get_filing
 from fastapi import HTTPException
 from pydantic import BaseModel
+import re
+from bs4 import BeautifulSoup, Tag
+from collections import OrderedDict
+import tiktoken
 
 # Configure logging
 
@@ -28,6 +32,11 @@ class Document(BaseModel):
     report_period: Optional[str]
     metadata: Dict[str, Any]
     sections: List[Section]
+
+class TestingResponse(BaseModel):
+    cik: str
+    text_elements: List[str]
+    sections: Dict[str, List[str]]
 
 # 2. Metadata extractor base + 10-K example
 class BaseMetadataExtractor:
@@ -65,6 +74,13 @@ class DefaultExtractor(BaseMetadataExtractor):
             "note": "fallback extractor – key fields may be missing"
         }
 
+def split_into_token_chunks(text: str, max_tokens: int = 1000, model: str = "gpt-3.5-turbo") -> list[str]:
+    enc = tiktoken.encoding_for_model(model)
+    tokens = enc.encode(text)
+    return [
+        enc.decode(tokens[i : i + max_tokens])
+        for i in range(0, len(tokens), max_tokens)
+    ]
 
 
 # Enhanced controller with document-type awareness and analysis optimization
@@ -79,37 +95,30 @@ async def fetch_analysis(cik: str, accession_number: str) -> Dict[str, Any]:
         html = resp.content
     
     # Select appropriate parser based on form type
-   
     elements: list = sp.Edgar10QParser().parse(html)
     text_elements = [elem.text for elem in elements]
-    tree = sp.TreeBuilder().build(elements)
-    print("\n\nTREE",tree.print())
-    # select extractor
-    extractor_map = {
-        "10-K": TenKExtractor,
-        # "10-Q": TenQExtractor,
-        # "8-K": EightKExtractor,
-        # "4":  Form4Extractor,
+
+    section_config = {
+        "10-K": ["Item 1.", "Item 1A.","Item 1B.","Item 1C.","Item 2.","Item 3.","Item 4.", "Item 5.","Item 6.","Item 7.","Item 7A.","Item 8.", "Item 9.", "Item 9A.", "Item 9B.", "Item 9C.", "Item 10.", "Item 11.", "Item 12.", "Item 13.", "Item 14.", "Item 15.", "Item 16.", "Item 153."],
+        "10-Q": ["Filed Status", "Incorporation by Reference"],
+        "8-K": "all",  # Example of a document type that should be parsed by token size
     }
-    if form_type not in extractor_map:
-        logging.warning(f"No extractor for {form_type}, using DefaultExtractor")
-
-    extractor_cls = extractor_map.get(form_type, DefaultExtractor)
-    extractor = extractor_cls(elements, tree)
-    metadata  = extractor.extract()
-    sections  = build_sections(tree)
-
-    doc = Document(
-        cik=cik,
-        accession_number=accession_number,
-        form_type=form_type,
-        filing_date=metadata["filing_date"],
-        report_period=metadata.get("report_period").isoformat(),
-        metadata=metadata,
-        sections=sections,
-    )
     
-    return doc.model_dump()
+    tree = sp.TreeBuilder().build(elements)
+    nodes_list = list(tree.nodes)
+
+    # Check if form_type is in config and if it's marked as "all"
+    if form_type in section_config and section_config[form_type] == "all":
+        # Parse entire document by token size
+        sections = {"content": split_into_token_chunks(clean_content(text_elements))}
+    elif form_type in section_config:
+        # Parse specific sections
+        sections = parse_sec_document(html, section_config[form_type])
+    else:
+        # Form type not in config, parse entire document by token size
+        sections = {"content": split_into_token_chunks(clean_content(text_elements))}
+
+    return TestingResponse(cik=cik, text_elements=text_elements, sections=sections)
 
 def build_sections(tree) -> List[Section]:
     sections = []
@@ -123,3 +132,58 @@ def build_sections(tree) -> List[Section]:
         ))
     return sections
 
+
+def parse_sec_document(html: str, sections_to_extract: list[str], max_tokens: int = 1000) -> OrderedDict[str, list[str]]:
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 1) prepare ordered raw-text store
+    raw_texts = OrderedDict((sec, "") for sec in sections_to_extract)
+
+    # 2) compile exact-match patterns
+    patterns = {
+        sec: re.compile(rf'^\s*{re.escape(sec)}(?=\s|$)', re.IGNORECASE)
+        for sec in sections_to_extract
+    }
+
+    current = None
+    buffer = []
+
+    for elem in soup.find_all(string=True):
+        if not isinstance(elem.parent, Tag):
+            continue
+        text = elem.get_text(strip=True)
+        # detect header
+        hit = next((sec for sec, pat in patterns.items() if pat.match(text)), None)
+        if hit:
+            if current:
+                raw_texts[current] = clean_content(buffer)
+                buffer = []
+            current = hit
+            buffer.append(text)
+            for sib in elem.parent.next_siblings:
+                if isinstance(sib, Tag) and any(p.match(sib.get_text(strip=True)) for p in patterns.values()):
+                    break
+                if isinstance(sib, Tag):
+                    buffer.append(sib.get_text(strip=True))
+        elif current:
+            buffer.append(text)
+
+    # save last
+    if current and buffer:
+        raw_texts[current] = clean_content(buffer)
+
+    # 3) split into token chunks & wrap missing
+    result = OrderedDict()
+    for sec, txt in raw_texts.items():
+        if not txt:
+            result[sec] = ["not found"]
+        else:
+            chunks = split_into_token_chunks(txt, max_tokens)
+            result[sec] = chunks
+    return result
+
+def clean_content(content_list: list) -> str:
+    """Clean and normalize extracted content"""
+    full_text = ' '.join(content_list)
+    # Remove excessive whitespace and line breaks
+    return re.sub(r'\s+', ' ', full_text).strip()
