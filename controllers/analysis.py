@@ -10,9 +10,14 @@ import re
 from bs4 import BeautifulSoup, Tag
 from collections import OrderedDict
 import tiktoken
+from .document_analyzer import analyze_document_content
+import groq
+import os
+from dotenv import load_dotenv
 
 # Configure logging
-
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 HEADERS = {"User-Agent": "YourCompanyName YourAppName (your-email@example.com)"}
 
@@ -33,10 +38,12 @@ class Document(BaseModel):
     metadata: Dict[str, Any]
     sections: List[Section]
 
-class TestingResponse(BaseModel):
+class DocumentAnalysis(BaseModel):
     cik: str
     text_elements: List[str]
     sections: Dict[str, List[str]]
+    groq_analysis: Optional[List[str]] = None
+    form_type: str
 
 # 2. Metadata extractor base + 10-K example
 class BaseMetadataExtractor:
@@ -102,23 +109,33 @@ async def fetch_analysis(cik: str, accession_number: str) -> Dict[str, Any]:
         "10-K": ["Item 1.", "Item 1A.","Item 1B.","Item 1C.","Item 2.","Item 3.","Item 4.", "Item 5.","Item 6.","Item 7.","Item 7A.","Item 8.", "Item 9.", "Item 9A.", "Item 9B.", "Item 9C.", "Item 10.", "Item 11.", "Item 12.", "Item 13.", "Item 14.", "Item 15.", "Item 16.", "Item 153."],
         "10-Q": ["Filed Status", "Incorporation by Reference"],
         "8-K": "all",  # Example of a document type that should be parsed by token size
+        "default": "all"  # Default case for undefined form types
     }
     
     tree = sp.TreeBuilder().build(elements)
     nodes_list = list(tree.nodes)
 
-    # Check if form_type is in config and if it's marked as "all"
-    if form_type in section_config and section_config[form_type] == "all":
+    # Get the appropriate section configuration for the form type
+    section_definition = section_config.get(form_type, section_config["default"])
+
+    # Check if the section definition is "all"
+    if section_definition == "all":
         # Parse entire document by token size
         sections = {"content": split_into_token_chunks(clean_content(text_elements))}
-    elif form_type in section_config:
-        # Parse specific sections
-        sections = parse_sec_document(html, section_config[form_type])
     else:
-        # Form type not in config, parse entire document by token size
-        sections = {"content": split_into_token_chunks(clean_content(text_elements))}
+        # Parse specific sections
+        sections = parse_sec_document(html, section_definition)
 
-    return TestingResponse(cik=cik, text_elements=text_elements, sections=sections)
+    # Perform analysis based on document type
+    analysis = analyze_document_content(form_type, sections)
+
+    return DocumentAnalysis(
+        cik=cik, 
+        text_elements=text_elements, 
+        sections=sections, 
+        groq_analysis=analysis,
+        form_type=form_type
+    )
 
 def build_sections(tree) -> List[Section]:
     sections = []
